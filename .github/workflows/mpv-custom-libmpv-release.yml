@@ -1,0 +1,258 @@
+name: libmpv custom build
+
+on:
+  workflow_dispatch:
+    inputs:
+      mpv_ref:
+        description: 'cohikta/mpv 的分支或 commit（写入 packages/mpv.cmake 的 GIT_TAG）'
+        required: false
+        default: 'master'
+        type: string
+      release_tag:
+        description: 'Release tag；重复发布用同一 tag 会覆盖同名资产'
+        required: false
+        default: 'libmpv-gpu-next'
+        type: string
+      gcc_arch_v3:
+        description: '启用 -DGCC_ARCH=x86-64-v3'
+        required: false
+        default: true
+        type: boolean
+      patch_path:
+        description: '补丁在仓库内的路径；留空则自动搜索 *libmpv*.patch'
+        required: false
+        default: ''
+        type: string
+      pin_cmake:
+        description: '固定 CMake 3.31.6（与项目自带 ExternalProject 模块版本一致）'
+        required: false
+        default: true
+        type: boolean
+      publish:
+        description: '上传资产到 GitHub Release；关闭时只保留 Actions artifact'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 mpv-dev (libmpv-2.dll)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/shinchiro/archlinux:latest
+    env:
+      PIN_CMAKE: ${{ inputs.pin_cmake }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: 固定 CMake 3.31.6
+        run: |
+          set -e
+          echo "系统 CMake: $(cmake --version | head -1)"
+          if [[ "$PIN_CMAKE" == "true" ]]; then
+            if python3 -m venv "$GITHUB_WORKSPACE/.cmake-venv" 2>/dev/null; then
+              "$GITHUB_WORKSPACE/.cmake-venv/bin/pip" install -q 'cmake==3.31.6'
+              echo "$GITHUB_WORKSPACE/.cmake-venv/bin" >> "$GITHUB_PATH"
+              echo "已固定 CMake 3.31.6（写入 GITHUB_PATH，下一步生效）"
+            else
+              echo "::warning::venv 不可用，退回系统 CMake；将依赖 -S 兼容补丁兜底"
+            fi
+          fi
+
+      - name: Git 基础配置与版本确认
+        run: |
+          set -e
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+          git config --global pull.rebase true
+          echo "CMake : $(cmake --version | head -1)"
+          echo "Git   : $(git --version)"
+          echo "Ninja : $(ninja --version)"
+          echo "Meson : $(meson --version)"
+
+      - name: 应用自定义 libmpv 补丁 + CMake 语法兼容修正
+        env:
+          PATCH_PATH: ${{ inputs.patch_path }}
+          MPV_REF: ${{ inputs.mpv_ref }}
+        run: |
+          set -e
+          if grep -q 'github.com/cohikta/mpv.git' packages/mpv.cmake; then
+            echo "补丁已包含在仓库中，跳过 git apply"
+          else
+            patch_file="$PATCH_PATH"
+            if [[ -z "$patch_file" || ! -f "$patch_file" ]]; then
+              patch_file=$(find "$GITHUB_WORKSPACE" -maxdepth 2 -type f \
+                             -iname '*libmpv*.patch' ! -path '*/packages/*' -print -quit)
+            fi
+            if [[ -z "$patch_file" || ! -f "$patch_file" ]]; then
+              echo "::error::未找到补丁，请把补丁放在仓库根目录或 patches/，或填写 patch_path 输入"
+              exit 1
+            fi
+            echo "使用补丁：$patch_file"
+            git apply --check "$patch_file"
+            git apply "$patch_file"
+          fi
+
+          # -H<SOURCE_DIR> 是 CMake 3.13 之前的旧写法，CMake 4.x 下不可靠。
+          # 只改确实含该写法的文件；-S <SOURCE_DIR> 在 CMake 里是两个参数，
+          # ExternalProject 会正确展开 <SOURCE_DIR> 占位符。幂等，可重复执行。
+          mapfile -t hfiles < <(grep -rl -- '-H<SOURCE_DIR>' packages/*.cmake 2>/dev/null || true)
+          for f in "${hfiles[@]}"; do
+            sed -i 's/-H<SOURCE_DIR>/-S <SOURCE_DIR>/g' "$f"
+            echo "兼容修正: $f"
+          done
+          echo "剩余 -H<SOURCE_DIR> 文件数: $(grep -rl -- '-H<SOURCE_DIR>' packages/*.cmake 2>/dev/null | wc -l)"
+
+          # 允许把 GIT_TAG 锁到指定 commit，便于复现某次发布
+          python3 - <<'PY'
+          import os, re
+          ref = (os.environ.get("MPV_REF") or "master").strip()
+          if not re.fullmatch(r"[A-Za-z0-9._/-]+", ref):
+              raise SystemExit("非法的 mpv_ref：" + ref)
+          p = "packages/mpv.cmake"
+          s = open(p, encoding="utf-8").read()
+          m = re.search(r"^    GIT_TAG .*$", s, re.M)
+          if m:
+              s = s[:m.start()] + "    GIT_TAG " + ref + s[m.end():]
+          else:
+              anchor = "    GIT_REPOSITORY https://github.com/cohikta/mpv.git\n"
+              s = s.replace(anchor, anchor + "    GIT_TAG " + ref + "\n", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("mpv GIT_TAG =", ref)
+          PY
+          grep -nE 'GIT_REPOSITORY|GIT_TAG|-Dd3d11|copy_directory' packages/mpv.cmake
+
+      - name: 恢复缓存
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build64
+            src_packages
+          key: custom-libmpv-v2-gcc-${{ inputs.gcc_arch_v3 }}-${{ github.run_id }}
+          restore-keys: |
+            custom-libmpv-v2-gcc-${{ inputs.gcc_arch_v3 }}-
+
+      - name: 配置并清理旧 mpv 源码
+        env:
+          GCC_V3: ${{ inputs.gcc_arch_v3 }}
+        run: |
+          set -e
+          # 缓存里可能残留指向 mpv-player/mpv 的 clone；ExternalProject 的
+          # check-git 会沿用已有 .git 的 remote，因此必须删掉并重新 clone。
+          rm -rf src_packages/mpv
+          # 清掉 mpv 的 ExternalProject 前缀，避免沿用官方 mpv 的 meson 配置
+          rm -rf build64/packages/mpv-prefix
+          extra=""
+          if [[ "$GCC_V3" == "true" ]]; then extra="-DGCC_ARCH=x86-64-v3"; fi
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 $extra \
+                -DSINGLE_SOURCE_LOCATION="$PWD/src_packages" \
+                -DRUSTUP_LOCATION="$PWD/clang_root/install_rustup" \
+                --fresh -G Ninja -B build64 -S "$PWD"
+
+      - name: 构建交叉工具链（仅首次）
+        run: |
+          if [[ ! -f build64/install/bin/cross-gcc ]]; then ninja -C build64 gcc; fi
+
+      - name: 下载全部源码
+        run: ninja -C build64 download || true
+
+      # 每次都重新 clone mpv，故无需 ninja update；本地增量构建才需要它。
+      - name: 编译 mpv / libmpv
+        run: ninja -C build64 mpv
+
+      - name: 验收自定义 libmpv
+        run: |
+          set -e
+          dev=$(find build64 -maxdepth 1 -type d -name 'mpv-dev-*' -print -quit)
+          test -n "$dev"
+          test -f "$dev/libmpv-2.dll"
+          test -f "$dev/libmpv.dll.a"
+          grep -q 'MPV_RENDER_PARAM_BACKEND' "$dev/include/mpv/render.h"
+          test -f "$dev/include/mpv/render_d3d11.h"
+          test -f "$dev/include/mpv/render_gl.h"
+          objdump=$(command -v x86_64-w64-mingw32-objdump || true)
+          [[ -n "$objdump" ]] || objdump=build64/install/bin/x86_64-w64-mingw32-objdump
+          "$objdump" -p "$dev/libmpv-2.dll" | grep -i 'mpv_render_context_create'
+          echo "验收通过：$dev"
+          ls -lh "$dev"
+
+      - name: 打 7z 包
+        run: |
+          set -e
+          rm -rf build64/mpv-debug-*
+          ninja -C build64 mpv-packaging
+          mkdir -p release
+          mv build64/mpv-dev-*.7z release/
+          (cd release && sha256sum mpv-dev-*.7z > SHA256SUMS.txt)
+          ls -lh release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpv-dev-x86_64
+          path: release/*
+          retention-days: 14
+
+      - name: 失败时打印 ExternalProject 日志
+        if: failure()
+        run: |
+          echo "===== 各包 configure / build / install 日志尾部 ====="
+          find build64 -type f \( \
+                -iname '*-configure-*.log' -o \
+                -iname '*-build-*.log' -o \
+                -iname '*-install-*.log' -o \
+                -name 'meson-log.txt' -o \
+                -name 'config.log' \) -print \
+            | while read -r f; do echo "----- $f -----"; tail -n 60 "$f"; done || true
+          echo "===== ngtcp2 配置脚本（若存在） ====="
+          cat build64/packages/ngtcp2-prefix/src/ngtcp2-stamp/ngtcp2-configure-.cmake 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-failure-logs
+          path: build64/**/*-*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 保存缓存（仅构建成功时）
+        # if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build64
+            src_packages
+          key: custom-libmpv-v2-gcc-${{ inputs.gcc_arch_v3 }}-${{ github.run_id }}
+
+  release:
+    name: 发布到 GitHub Release
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mpv-dev-x86_64
+          path: release
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          MPV_REF: ${{ inputs.mpv_ref }}
+        run: |
+          set -e
+          if ! gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GH_REPO" --title "$TAG" \
+              --notes "自定义 libmpv（cohikta/mpv@${MPV_REF}，gpu-next/D3D11 render backend），由 mpv-winbuild-cmake 构建。"
+          fi
+          gh release upload "$TAG" release/* --repo "$GH_REPO" --clobber
+          gh release view "$TAG" --repo "$GH_REPO" --json url --jq '.url'

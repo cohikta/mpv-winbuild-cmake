@@ -25,7 +25,9 @@ ExternalProject_Add(mpv
         subrandr
         libsixel
         curl
-    GIT_REPOSITORY https://github.com/mpv-player/mpv.git
+    # Custom libmpv: gpu-next / D3D11 render backend (MPV_RENDER_PARAM_BACKEND)
+    GIT_REPOSITORY https://github.com/cohikta/mpv.git
+    GIT_TAG master
     SOURCE_DIR ${SOURCE_LOCATION}
     GIT_CLONE_FLAGS "--filter=tree:0"
     UPDATE_COMMAND ""
@@ -41,6 +43,8 @@ ExternalProject_Add(mpv
         -Db_lto=true
         ${mpv_lto_mode}
         -Dlibmpv=true
+        # required by libmpv_gpu_next_d3d11.c and render_d3d11.h
+        -Dd3d11=enabled
         -Dpdf-build=enabled
         -Dlua=enabled
         -Djavascript=enabled
@@ -82,10 +86,8 @@ ExternalProject_Add_Step(mpv copy-binary
     ${mpv_copy_debug}
     COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv-2.dll          ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv-2.dll
     COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv.dll.a          ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv.dll.a
-    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/client.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/client.h
-    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/stream_cb.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/stream_cb.h
-    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render.h       ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render.h
-    COMMAND ${CMAKE_COMMAND} -E copy <SOURCE_DIR>/include/mpv/render_gl.h    ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv/render_gl.h
+    # Ship every public header: patched render.h plus 0.42 render_d3d11.h
+    COMMAND ${CMAKE_COMMAND} -E copy_directory <SOURCE_DIR>/include/mpv ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/include/mpv
     COMMENT "Copying mpv binaries and manual"
 )
 
